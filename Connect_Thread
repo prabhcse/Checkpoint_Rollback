@@ -1,0 +1,42 @@
+package pack;
+
+import java.util.ArrayList;
+
+public class Connect_Thread implements Runnable
+{
+	Connect client;
+	FIFO fifo;
+	String next;
+	String controlMsg;
+	ArrayList<String> node;
+	ArrayList<Integer> port;
+	
+	public Connect_Thread(FIFO fifo, ArrayList<String> node, ArrayList<Integer> port)
+	{
+		this.fifo = fifo;
+		this.node = node;
+		this.port = port;
+		client = new Connect();
+		next = new String();
+		controlMsg = new String();
+	}
+	
+	public void run() 
+	{
+		while(true)
+		{
+			// Gets blocked here if FIFO is empty
+			// Put data format - "dest=data"
+			String data = fifo.getFIFO();
+			if(!data.equals("NULL"))
+			{
+				String temp[] = data.split("=");
+				next = temp[0];
+				controlMsg = temp[1];
+				client.live(new StringBuffer().append(node.get(Integer.parseInt(next))).
+						append("-").
+						append(port.get(Integer.parseInt(next))).toString(), controlMsg);
+			}
+		}
+	}
+}
