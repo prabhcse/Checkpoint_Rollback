@@ -1,0 +1,68 @@
+package pack;
+
+import java.util.ArrayList;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+
+public class Account_Thread implements Runnable{
+
+	// Amount, Vector_Clock, (LLS, FLS)
+	Account acc;
+	FIFO fifo;
+	int index;
+	// Handles the Label Values to all its output channels
+	ArrayList<Integer> neighbors;
+	// Store the clock times
+	// ArrayList<Integer> vector_clk;
+	// a is initial amount in account
+	public Account_Thread(ArrayList<Integer> neighbors, int index, FIFO fifo, Account acc)
+	{
+		this.acc = acc;
+		this.neighbors = neighbors;
+		this.index = index;
+		this.fifo = fifo;
+	}
+	
+	public void run() 
+	{
+		System.out.println("Starting Bank Balance:"+acc.getAmount());
+		// Wait to make sure all Servers are up
+		try {
+			TimeUnit.SECONDS.sleep(7);
+		} catch (InterruptedException e) {
+			e.printStackTrace();
+		}
+		int counter = 0;	
+		Random r = new Random();
+		// Create Sending Money Transactions
+		// AM-ID LABEL AMT CLOCK,
+		while(counter < 20)
+		{
+			// Inter-Transaction time
+			try {
+				TimeUnit.SECONDS.sleep(3);
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+			int send = r.nextInt(10)+1;
+			// Decide whom to send to
+			int dest_index = r.nextInt(neighbors.size());
+			int dest_node = neighbors.get(dest_index);
+			String data = acc.send_Money(send, dest_index, dest_node, index);
+			// Means the 'send' is trying to send more money than in account
+			if(data.equals("NOSEND"))
+			{
+				counter++;
+				continue;
+			}
+			else
+			{
+				data = new String(dest_node+"=").concat(data);
+				System.out.println("Account_Thread putting to FIFO: "+data);
+				fifo.putFIFO(new String(data));
+			}
+		}
+		System.out.println("EXITING: ACCOUNT THREAD:"+index);
+	}
+
+}
