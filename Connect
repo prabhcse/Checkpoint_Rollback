@@ -1,0 +1,82 @@
+package pack;
+
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.ClosedByInterruptException;
+import java.nio.channels.UnresolvedAddressException;
+import com.sun.nio.sctp.MessageInfo;
+import com.sun.nio.sctp.SctpChannel;
+
+public class Connect 
+{
+	public static final int MESSAGE_SIZE = 1000;
+	//public static final String domain = ".utdallas.edu";
+	
+	// next "dc21.utdallas.edu-12345"
+	// controlMsg "AM-ID Label Amount Clock"
+	public void live(String next, String controlMsg)
+	{
+		SctpChannel sctpChannel = null;
+		try
+		{
+			System.out.println("------ Sending Message:"+controlMsg+". , "+"TO = "+next);
+			String[] tempArray = next.split("-");
+			String hostname = tempArray[0];
+			int port = Integer.parseInt(tempArray[1]);
+			
+			ByteBuffer byteBuffer = ByteBuffer.allocate(MESSAGE_SIZE);
+			SocketAddress socketAddress = new InetSocketAddress(hostname,port);
+			sctpChannel = SctpChannel.open();
+			sctpChannel.bind(new InetSocketAddress(0));
+			sctpChannel.connect(socketAddress);
+			MessageInfo messageInfo = MessageInfo.createOutgoing(null,0);
+			byteBuffer.put(controlMsg.getBytes(),0,controlMsg.getBytes().length);
+			byteBuffer.flip();
+			sctpChannel.send(byteBuffer,messageInfo);
+		}
+		catch(UnsupportedOperationException e)
+		{
+			System.out.println("UnsupportedOperationException in Client : "+e.getMessage());
+			e.printStackTrace();
+		}
+		catch(UnresolvedAddressException e)
+		{
+			System.out.println("UnresolvedAddessException in Client : "+e.getMessage());
+			e.printStackTrace();
+		}
+		catch(ClosedByInterruptException e)
+		{
+			System.out.println("ClosedByInterruptException in Client : "+e.getMessage());
+			e.printStackTrace();
+		}
+		catch(AsynchronousCloseException e)
+		{
+			System.out.println("AsyncCloseException in Client : "+e.getMessage());
+			e.printStackTrace();
+		}
+		catch(IOException e)
+		{
+			System.out.println("IOException in Client : "+e.getMessage());
+			e.printStackTrace();
+		}
+		finally
+		{
+			if(sctpChannel != null)
+			{
+				try 
+				{
+					sctpChannel.close();
+				} 
+				catch (IOException e) 
+				{
+					System.out.println("In Client: Error while Closing Channel");
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+}
