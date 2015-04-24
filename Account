@@ -1,0 +1,245 @@
+package pack;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.util.ArrayList;
+
+public class Account {
+	// User's account amount, not part of Control Messages
+	private int amount;
+	// Keeps check if send event are to be frozen, its updating handled by Process Class
+	private boolean freeze;
+	// Last Label Sent
+	private ArrayList<Integer> LLS;
+	//private ArrayList<Integer> tempLLS;
+	// First Label Sent
+	private ArrayList<Integer> FLS;
+	//private ArrayList<Integer> tempFLS;
+	// Sent Label values, to keep labels monotonically increasing
+	private ArrayList<Integer> ch_label;
+	// Vector Clock, not part of Control Messages
+	private ArrayList<Integer> vectorC;
+	// List of Sent Amounts
+	private ArrayList<String> sentM;
+	
+	public synchronized boolean isFreeze() 
+	{
+		return freeze;
+	}
+	// Set if, either in Checkpoint or Recovery mode
+	public synchronized void setFreeze(boolean freeze) 
+	{
+		// ***** IMPORTANT ***** TO DO
+		//freeze = false;
+		this.freeze = freeze;
+		if(!this.freeze)
+		{
+			notify();
+		}
+	}
+
+	public synchronized ArrayList<String> getSentM() {
+		return sentM;
+	}
+	public synchronized void setSentM(ArrayList<String> sentM) {
+		this.sentM = sentM;
+	}
+	public Account(int a, int neighSize, int nodeSize)
+	{
+		amount = a;
+		freeze = false;
+		LLS = new ArrayList<Integer>();
+		//tempLLS = new ArrayList<Integer>();
+		FLS = new ArrayList<Integer>();
+		//tempFLS = new ArrayList<Integer>();
+		ch_label = new ArrayList<Integer>();
+		vectorC = new ArrayList<Integer>();
+		sentM = new ArrayList<String>();
+		
+		for(int i=0; i < neighSize; i++)
+		{
+			LLS.add(0);
+			FLS.add(0);
+			ch_label.add(0);
+		}
+		for(int i=0; i < nodeSize; i++)
+		{
+			vectorC.add(0);
+		}
+	}
+	
+	// Account_Thread handles it.
+	// Returns the Label, Amount, Clock values (L A C)
+	public synchronized String send_Money(int send, int dest_index, int dest_node, int index)
+	{
+		int amt = -1;
+		String data = null;
+		// If freeze is true, then put Account_Thread to wait()
+		if(this.isFreeze())
+		{
+			try {
+				wait();
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+		}
+		if(this.getAmount() >= send)
+		{
+			amt = this.getAmount() - send;
+			this.setAmount(amt);
+			System.out.println("Bank Balance:"+this.getAmount()+", Sending:"+send);
+		}
+		
+		if(amt < 0)
+		{
+			//System.out.println("Cannot Send: "+send+", Balance Low: "+this.getAmount());
+			// Don't update Label and Clock values, Send event not be generated
+			data = new String("NOSEND");
+		}
+		else
+		{
+			// Saving the sent Messages
+			this.getSentM().add(new String(dest_node+","+send));
+			int label = this.getCh_label().get(dest_index) + 1;
+			// Updating my clock
+			int clock = this.getVectorC().get(index) + 1;
+			this.getVectorC().set(index, clock);
+			
+			this.getCh_label().set(dest_index, label);
+			// LLS value
+			this.getLLS().set(dest_index, label);
+			if(this.getFLS().get(dest_index) == 0)
+			{
+				this.getFLS().set(dest_index, label);
+			}
+			data = new StringBuffer().append("AM").append("-").append(index).append(" ").append(label).append(" ").append(send).toString();
+			for(int i=0; i < this.getVectorC().size(); i++)
+			{
+				data = data.concat(" "+this.getVectorC().get(i));
+			}
+			System.out.println("Label Values:");
+			System.out.println("LLS Values:"+this.getLLS());
+			System.out.println("FLS Values:"+this.getFLS());
+			System.out.println("ch_label Values:"+this.getCh_label());
+		}
+		return data;
+	}
+	
+	// Process class updates the money
+	// Also updates the Clock
+	public synchronized void receive_Money(int amount, ArrayList<Integer> v_Clock, int index)
+	{
+		// updates with received amount
+		this.setAmount(this.getAmount() + amount); 
+		// update Vector clock
+		for(int i = 0; i < v_Clock.size(); i++)
+		{
+			if(i == index)
+			{
+				if(v_Clock.get(i) > this.getVectorC().get(i))
+				{
+					System.out.println("Error: cannot have higher clock value: "+index);
+				}
+				else
+				{
+					continue;
+				}
+			}
+			else if(i != index)
+			{
+				if(v_Clock.get(i) > this.getVectorC().get(i))
+				{
+					this.getVectorC().set(i, v_Clock.get(i));
+				}
+				else
+				{
+					continue;
+				}
+			}
+			else
+			{
+				System.out.println(" ******** ERROR: IN vector clock computation.");
+			}
+		}
+		int clock_update = this.getVectorC().get(index)+1;
+		// Update my own clock index
+		this.getVectorC().set(index, clock_update);
+	}
+	
+	// Comparison of LLR and FLS values
+	public synchronized boolean tentative_check(int llr_rec, int index)
+	{
+		boolean result = false;
+		// FLS > 0 and LLR >= FLS, 0 is bottom value
+		if(this.getFLS().get(index) > 0 && llr_rec >= this.getFLS().get(index))
+		{
+			// take tentative checkpoint
+			result = true;
+			this.setFreeze(result);
+		}
+		// My Last Checkpoint
+		/*BufferedReader reader = new BufferedReader(new FileReader(file));
+		String line = null;
+		while( (line = reader.readLine()) != null)
+		{
+			System.out.println(line);
+		}*/
+		
+		return result;
+	}
+	
+	/*public synchronized ArrayList<Integer> getTempLLS() {
+		return tempLLS;
+	}
+	public synchronized void setTempLLS(ArrayList<Integer> tempLLS) {
+		this.tempLLS = tempLLS;
+	}*/
+	/*public synchronized ArrayList<Integer> getTempFLS() {
+		return tempFLS;
+	}
+	public synchronized void setTempFLS(ArrayList<Integer> tempFLS) {
+		this.tempFLS = tempFLS;
+	}*/
+	// Getters and Setters
+	public synchronized int getAmount() {
+		return amount;
+	}
+	
+	public synchronized void setAmount(int amount) {
+		this.amount = amount;
+	}
+
+	public synchronized ArrayList<Integer> getLLS() {
+		return LLS;
+	}
+
+	public synchronized void setLLS(ArrayList<Integer> lls) {
+		LLS = lls;
+	}
+
+	public synchronized ArrayList<Integer> getFLS() {
+		return FLS;
+	}
+
+	public synchronized void setFLS(ArrayList<Integer> fls) {
+		FLS = fls;
+	}
+
+	public synchronized ArrayList<Integer> getCh_label() {
+		return ch_label;
+	}
+
+	public synchronized void setCh_label(ArrayList<Integer> ch_label) {
+		this.ch_label = ch_label;
+	}
+
+	public synchronized ArrayList<Integer> getVectorC() {
+		return vectorC;
+	}
+
+	public synchronized void setVectorC(ArrayList<Integer> vectorC) {
+		this.vectorC = vectorC;
+	}
+
+}
