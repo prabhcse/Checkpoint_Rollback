@@ -1,0 +1,1018 @@
+package pack;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+
+import com.sun.nio.sctp.MessageInfo;
+import com.sun.nio.sctp.SctpChannel;
+import com.sun.nio.sctp.SctpServerChannel;
+
+public class Process implements Runnable
+{
+	// Sending to Connect
+	FIFO fifo;
+	// Keeps LLS and FLS values, Vector_Clock, Amount
+	Account acc;
+	final int MESSAGE_SIZE = 1000;
+	final int minDelay = 10;
+	// Keeps Machine names
+	ArrayList<String> node;
+	// Keeps Port numbers
+	ArrayList<Integer> port;
+	// Keeps store of Output Channels, node indexes
+	ArrayList<Integer> neighbors;
+	// Last Label Received
+	ArrayList<Integer> LLR;
+	// The neighbors with non-bottom LLR values
+	ArrayList<Integer> cohorts;
+	// Sequence of Execution
+	ArrayList<String> sequence;
+	// Count of Cohorts, get it from LLR, non-bottom values
+	int approvalCnt;
+	// Current Process's Index
+	int index;
+	// Currently in Checkpoint mode
+	boolean chkpt;
+	// Currently in Recovery mode
+	boolean recover;
+	Random r = new Random();
+	// Sequence No of Checkpoint, set if currently in CHK or RLBK mode
+	int seqNum;
+	// Index of Sequence, who acts as Initiator
+	int initiator;
+	// Index of sender, of First sender of Control Message, set if currently in CHK or RLBK mode
+	int sender;
+	//Count to determine how many processes want to rollback
+	int rollbackCnt;
+	
+	// Verification
+	int processCount;
+	int Vector_Clock[][];
+	
+	public Process
+	(ArrayList<String> node, ArrayList<Integer> port, ArrayList<Integer> neighbors, int index, FIFO fifo, Account acc, ArrayList<String> sequence)
+	{
+		
+		this.node = node;
+		this.port = port;
+		this.neighbors = neighbors;
+		this.index = index;
+		this.fifo = fifo;
+		this.acc = acc;
+		this.sequence = sequence;
+		this.rollbackCnt = 0; 
+		
+		LLR = new ArrayList<Integer>(); 
+		cohorts = new ArrayList<Integer>();
+		// Initializing to bottom values(zeroes)
+		// Bottom values are assigned to be 0
+		for(int j=0; j < neighbors.size();j++)
+		{
+			LLR.add(0);
+		}
+		approvalCnt = 0;
+		chkpt = false;
+		recover = false;
+		seqNum = 0;
+		initiator = -1;
+		sender = -1;
+		
+		processCount = 0;
+		// Initialize all elements to zero
+		Vector_Clock = new int[this.node.size()][this.node.size()];
+	}
+	
+	public void run() 
+	{
+		SctpServerChannel serverChannel = null;
+		ByteBuffer byteBuffer = ByteBuffer.allocate(MESSAGE_SIZE);
+		try
+		{
+			// Starting current server
+			System.out.println("Machine:"+node.get(index)+", Port:"+port.get(index));
+			// Save the first checkpoint here, save to file
+			// split works on regular expressions
+			// split on (".") means any character
+			char[] name = node.get(index).toCharArray();
+			String filename = new String();
+			for(int i = 0; i < name.length; i++ )
+			{
+				if(name[i] == '.')
+				{
+					break;
+				}
+				filename = filename.concat(String.valueOf(name[i]));
+			}
+			filename = filename.concat("_"+port.get(index)+".txt");
+			
+			serverChannel = SctpServerChannel.open();
+			InetSocketAddress serverAddr = new InetSocketAddress(port.get(index));
+			serverChannel.bind(serverAddr);
+			System.out.println("Process:"+index+" has Server up");
+			
+			if(sequence.isEmpty())
+			{
+				System.out.println("Sequence is empty");
+				System.exit(1);// TO DO
+			}
+			
+			// Wait to make sure all Servers are up
+			try {
+				TimeUnit.SECONDS.sleep(7);
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+			
+			// Setting Initiator as protocol starts
+			initiator = 0;
+			// Check if I am first in sequence
+			// format "Index,c" or "Index,r"
+			String temp1[] = sequence.get(initiator).split(",");
+			temp1[0] = String.valueOf(Integer.parseInt(temp1[0]) - 1);
+			
+			// Checkpoint
+			if( temp1[0].equals(String.valueOf(index)) && ( temp1[1].equals("c") || temp1[1].equals("C")) )
+			{
+				try {
+					TimeUnit.SECONDS.sleep(minDelay);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+				cohorts = new ArrayList<Integer>();
+				// Sender of first checkpoint message
+				sender = -1;
+				seqNum = 1;
+				// Checkpoint mode
+				chkpt = true;
+				// **** IMPORTANT **** Setting the FREEZE flag
+				acc.setFreeze(true);
+				// Saving the Checkpoint,
+				// Reset LLS, FLS, sentM
+				saveCheckpoint(filename);
+				// Reset LLR
+				sendToCohorts();
+				// IF Initiator has no cohorts, current protocol ends here itself
+				if(cohorts.isEmpty())
+				{
+					approvalCnt = 0;
+					// Verification: "GET-ID", broadcast to everyone
+					sendVerify();
+					// Reset variables and send NXT message, initiator set in nextInitiator()
+					nextInitiator();
+					seqNum = 0;
+					sender = -1;
+					chkpt = false;
+					// *** IMPORTANT *** : Resetting the FREEZE flag
+					acc.setFreeze(false);
+				}
+				else
+				{
+					approvalCnt = cohorts.size();
+				}
+			}
+			// Rollback, Resetting-LLR only done if agreed for recovery, otherwise not.
+			else if( temp1[0].equals(String.valueOf(index)) && ( temp1[1].equals("r") || temp1[1].equals("R")) )
+			{
+				try {
+					TimeUnit.SECONDS.sleep(minDelay);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+				// Sender of first rollback message
+				sender = -1;
+				seqNum = 1;
+				acc.setFreeze(true);
+				// Resetting LLR values
+				//reset(LLR);
+				acc.setFLS(resetLabel(LLR.size()));
+				System.out.println("LLR:"+LLR);
+				System.out.println("FLS:"+acc.getFLS());
+				recover = true;
+				
+				File file = new File(filename);
+				BufferedReader br = new BufferedReader(new FileReader(file));
+				String line=br.readLine();
+				while(line!=null)
+				{
+					if(line.substring(0,4).equals("AMT"))
+					{
+						acc.setAmount(Integer.parseInt(line.substring(4)));
+					}
+					else if(line.substring(0,4).equals("LLS"))
+					{
+						line = line.substring(4);
+						String[] words = line.split(" ");
+						ArrayList<Integer> LLS = new ArrayList<Integer>();
+						for(int i=0;i<words.length;i++)
+						{
+							LLS.add(Integer.parseInt(words[i]));
+						}
+						acc.setCh_label(LLS);
+						acc.setLLS(LLS);
+					}
+					else if(line.substring(0,4).equals("CLK"))
+					{
+						line = line.substring(4);
+						String[] words = line.split(" ");
+						ArrayList<Integer> vector = new ArrayList<Integer>();
+						for(int i=0;i<words.length;i++)
+						{
+							vector.add(Integer.parseInt(words[i]));
+						}
+						acc.setVectorC(vector);
+					}
+					
+					line=br.readLine();
+				}
+				rollbackCnt = neighbors.size();
+				for(int i=0;i<neighbors.size();i++)
+				{
+					StringBuffer str = new StringBuffer().append(neighbors.get(i)).append("=").append("PREPRLBK").append("-")
+					.append(index).append(" ").append(seqNum).append(" ").append(acc.getLLS().get(i));
+					fifo.putFIFO(new String(str.toString()));
+				}
+				
+			}
+			temp1 = null;
+			
+			while(true)
+			{	
+				System.out.println("######## Initiator:"+initiator);
+				SctpChannel sctpCh = serverChannel.accept();
+				MessageInfo messageInfo = sctpCh.receive(byteBuffer, null, null);
+				String messagePart = byteToString(byteBuffer, messageInfo.bytes());
+				// Clearing to receive message 
+				byteBuffer.clear();
+				//String controlMsg = null;
+				String[] msg = messagePart.split("-");
+				System.out.println("--- Received Message:"+messagePart+".");
+				
+				// I am next Initiator, index of sequence
+				// format "NXT-INDEX SEQ" or "NXT-DONE"
+				if(msg[0].equals("NXT"))
+				{
+					String[] data = msg[1].split(" ");
+					if(msg[1].equals("DONE"))
+					{
+						System.out.println("\n******** COMPLETE:No next process in the sequence ********");
+						System.out.println("\n******** Protocol Terminates ********");
+						//System.exit(1);
+					}
+					else
+					{
+						// Get the next index for initiator
+						initiator = Integer.parseInt(data[0]);
+					}
+					
+					// Need to check for "DONE", because of split function
+					if( !msg[1].equals("DONE"))
+					{
+						// format "Index,c" or "Index,r"
+						String temp[] = sequence.get(initiator).split(",");
+						temp[0] = String.valueOf(Integer.parseInt(temp[0]) - 1);
+						try {
+							TimeUnit.SECONDS.sleep(minDelay);
+						} catch (InterruptedException e) {
+							e.printStackTrace();
+						}
+						if( temp[0].equals(String.valueOf(index)) && temp[1].equals("c") || temp[1].equals("C"))
+						{
+							cohorts = new ArrayList<Integer>();
+							// Sender of first checkpoint message
+							sender = -1;
+							seqNum = Integer.parseInt(data[1]) + 1;
+							chkpt = true;
+							// **** IMPORTANT **** Setting the FREEZE flag
+							acc.setFreeze(true);
+							// Saving the Checkpoint, Resets LLS, FLS, sentM
+							saveCheckpoint(filename);
+							// Resets LLR
+							sendToCohorts();
+							
+							// IF Initiator has no cohorts, current protocol ends here itself
+							if(cohorts.isEmpty())
+							{
+								approvalCnt = 0;
+								// Verification: "GET-ID", broadcast to everyone
+								sendVerify();
+								// Reset variables and send NXT message
+								nextInitiator();
+								seqNum = 0;
+								sender = -1;
+								chkpt = false;
+								// *** IMPORTANT *** : Resetting the FREEZE flag
+								acc.setFreeze(false);
+							}
+							else
+							{
+								approvalCnt = cohorts.size();
+							}
+						}
+						else if( temp[0].equals(String.valueOf(index)) && temp[1].equals("r") || temp[1].equals("R"))
+						{
+							// Sender of first rollback message
+							sender = -1;
+							seqNum = Integer.parseInt(data[1]) + 1;
+							recover = true;
+							acc.setFreeze(true);
+							//reset(this.LLR);
+							acc.setFLS(resetLabel(LLR.size()));
+							rollbackCnt = 0;				
+							
+							File file = new File(filename);
+							BufferedReader br = new BufferedReader(new FileReader(file));
+							String line=br.readLine();
+							while(line!=null)
+							{
+								if(line.substring(0,4).equals("AMT"))
+								{
+									acc.setAmount(Integer.parseInt(line.substring(4)));
+								}
+								else if(line.substring(0,4).equals("LLS"))
+								{
+									line = line.substring(4);
+									String[] words = line.split(" ");
+									ArrayList<Integer> LLS = new ArrayList<Integer>();
+									for(int i=0;i<words.length;i++)
+									{
+										LLS.add(Integer.parseInt(words[i]));
+									}
+									acc.setCh_label(LLS);
+									acc.setLLS(LLS);
+								}
+								else if(line.substring(0,4).equals("CLK"))
+								{
+									line = line.substring(4);
+									String[] words = line.split(" ");
+									ArrayList<Integer> vector = new ArrayList<Integer>();
+									for(int i=0;i<words.length;i++)
+									{
+										vector.add(Integer.parseInt(words[i]));
+									}
+									acc.setVectorC(vector);
+								}
+								line=br.readLine();
+							}
+							rollbackCnt = neighbors.size();
+							for(int i=0;i<neighbors.size();i++)
+							{
+								StringBuffer str = new StringBuffer().append(neighbors.get(i)).append("=").append("PREPRLBK").append("-")
+								.append(index).append(" ").append(seqNum).append(" ").append(acc.getLLS().get(i));
+								fifo.putFIFO(new String(str.toString()));
+							}
+
+						}
+					}
+				}
+				// Received Bank Transaction
+				// (AMOUNT format "AM-ID LABEL AMOUNT CLOCKS")
+				else if(msg[0].equals("AM"))
+				{
+					String[] data = msg[1].split(" ");
+					int source = Integer.parseInt(data[0]);
+					// Update LLR, Amount, Clock
+					int label_rec = Integer.parseInt(data[1]);
+					// Making sure label is monotonically increasing
+					//System.out.println("Current Label: "+LLR.get(neighbors.indexOf(source))+", Received Label: "+label_rec+", From: "+source);
+					LLR.set(neighbors.indexOf(source), label_rec);
+					int amount_rec = Integer.parseInt(data[2]);
+					// Get the clock values
+					ArrayList<Integer> vec_rec = new ArrayList<Integer>();
+					for(int i=3; i < data.length; i++)
+					{
+						vec_rec.add(Integer.parseInt(data[i]));
+					}
+					// Update My Amount, Clock
+					acc.receive_Money(amount_rec, vec_rec, index);
+				}
+				
+				// Received Control Message - "Take Checkpoint"
+				// (Take Checkpoint Format "TKCHK-ID SEQ LLR(j)")
+				else if(msg[0].equals("TKCHK"))
+				{
+					String[] data = msg[1].split(" ");
+					StringBuffer buf = null;
+					// Check if already taken tentative checkpoint, sender will be -1, If I am initiator
+					if(chkpt)
+					{
+						buf = new StringBuffer();
+						// Got TKCHK in chkpt mode, means I am in LLR of sender, because I sent something
+						// Whatever I sent was done before my taking of current tentative checkpoint, so it is covered
+						buf.append(Integer.parseInt(data[0])).append("=").
+						append("SCHK").append("-").append(index).append(" ").append(Integer.parseInt(data[1]));
+						fifo.putFIFO(new String(buf.toString()));
+					}
+					else
+					{
+						int llr_rec = Integer.parseInt(data[2]);
+						// Check FLS > 0 && LLR >= FLS
+						// True - Send TKCHK to cohorts, reset LLR
+						if(chkpt = acc.tentative_check(llr_rec, neighbors.indexOf(Integer.parseInt(data[0]))))
+						{
+							cohorts = new ArrayList<Integer>();
+							// Sender of first checkpoint message
+							sender = Integer.parseInt(data[0]);
+							seqNum = Integer.parseInt(data[1]);
+							// Initiator has been set when previous NXT was sent
+							// Initiator Set in the start of server
+							// Moved to save Tentative Checkpoint file
+							saveCheckpoint(filename);
+							// Send "TKCHK" messages to cohorts
+							sendToCohorts();
+							// Reply to sender with Success, If I have no cohorts
+							if(cohorts.isEmpty())
+							{
+								buf = new StringBuffer();
+								approvalCnt = 0;
+								buf.append(sender).append("=").
+								append("SCHK").append("-").append(index).append(" ").append(seqNum);
+								fifo.putFIFO(new String(buf.toString()));
+							}
+							else
+							{
+								approvalCnt = cohorts.size();
+							}
+						}
+						// tentative_check returns False - send Success
+						else
+						{
+							buf = new StringBuffer();
+							buf.append(Integer.parseInt(data[0])).append("=").
+							append("SCHK").append("-").append(index).append(" ").append(Integer.parseInt(data[1]));
+							fifo.putFIFO(new String(buf.toString()));
+						}
+						
+					}
+				}
+				
+				// Received Yes from Cohort
+				// (Yes from Cohort Format "SCHK-ID SEQ")
+				else if(msg[0].equals("SCHK"))
+				{
+					String[] data = msg[1].split(" ");
+					StringBuffer buf = null;
+					// Got SCHK from one of my cohorts and for current sequence of Checkpoint
+					if(!cohorts.isEmpty() && cohorts.contains(Integer.parseInt(data[0])) && seqNum == Integer.parseInt(data[1]))
+					{
+						approvalCnt--;
+						if(approvalCnt == 0)
+						{
+							if(sender == -1)// I am the Initiator and my all cohorts replied back
+							{
+								// Send MKPERM to Cohorts
+								System.out.println("Sending Make Checkpoints Permanent, Cohorts Size:"+cohorts.size());
+								for(int i=0; i < cohorts.size(); i++)
+								{
+									buf = new StringBuffer();
+									buf.append(cohorts.get(i)).append("=").
+									append("MKPERM").append("-").append(index).append(" ").append(seqNum);
+									fifo.putFIFO(new String(buf.toString()));
+								}
+								// Resetting COHORTS
+								cohorts = new ArrayList<Integer>();
+								// Resetting initiator
+								//initiator = -1;
+								chkpt = false;
+								// Verification: "GET-ID", broadcast to everyone
+								sendVerify();
+								// Reset variables and send NXT message, initiator set in nextInitiator()
+								nextInitiator();
+								// Resetting seqNum, after sending to next initiator
+								seqNum = 0;
+								// *** IMPORTANT *** : Resetting the FREEZE flag
+								acc.setFreeze(false);
+							}
+							else if(sender != -1)// I am non-Initiator and I have a sender
+							{
+								buf = new StringBuffer();
+								buf.append(sender).append("=").
+								append("SCHK").append("-").append(index).append(" ").append(seqNum);
+								fifo.putFIFO(new String(buf.toString()));
+							}
+							/*else
+							{
+								System.out.println("******** ERROR: Incorrect Cohort Setting.");
+							}*/
+						}
+						else if(approvalCnt < 0)
+						{
+							System.out.println("********ERROR: incorrect approvalCnt:"+approvalCnt+" in:"+index);
+						}
+					}
+					else
+					{
+						System.out.println("********** Error: No cohorts in: "+index+", Still Got:SCHK from "+msg[1]);
+					}
+				}
+				
+				// Received - "Make Checkpoint Permanent"
+				// (Make Permanent Format "MKPERM-ID SEQ")
+				else if(msg[0].equals("MKPERM"))
+				{
+					System.out.println("Saving as Permanent Checkpoint");
+					String[] data = msg[1].split(" ");
+					StringBuffer buf = new StringBuffer();
+					// Cannot get MKPERM from myself
+					if(Integer.parseInt(data[0]) == index)
+					{
+						System.out.println("******* ERROR: Cannot get MKPERM message from myself");
+					}
+					// Got the MKPERM message, from my Sender and For current sequence of protocol
+					else if(Integer.parseInt(data[0]) == sender && chkpt && Integer.parseInt(data[1]) == seqNum)
+					{
+						/*String temp[] = sequence.get(initiator).split(",");
+						temp[0] = String.valueOf(Integer.parseInt(temp[0]) - 1);
+						// If I am the Initiator here
+*/						/*if(Integer.parseInt(temp[0]) == index)
+						{*/
+							// Send MKPERM to Cohorts, if any
+							for(int i=0; i < cohorts.size(); i++)
+							{
+								buf = new StringBuffer();
+								buf.append(cohorts.get(i)).append("=").
+								append("MKPERM").append("-").append(index).append(" ").append(seqNum);
+								fifo.putFIFO(new String(buf.toString()));
+							}
+							// Reset the cohorts
+							cohorts = new ArrayList<Integer>();
+							// Resetting seqNum, initiator, sender and chkpt
+							seqNum = 0;
+							//initiator = -1;
+							sender = -1;
+							chkpt = false;
+							// *** IMPORTANT *** : Resetting the FREEZE flag
+							acc.setFreeze(false);
+						//}
+						/*else
+						{
+							System.out.println("******* ERROR: current Initiator is incorrect, Correct I:"+temp[0]+"\n******* Current I:"+initiator);
+						}*/
+						
+					}// end of else if(sender and seqNum)
+					/*else
+					{
+						System.out.println("******** ERROR: Got MKPERM from incorrect process:"+Integer.parseInt(data[1]));
+					}*/
+				}
+				// Verification done after NXT
+				// Initiator Broadcasts GET-ID to get the Vector Clocks of all the processes 
+				// VEC-ID C1 C2 C3
+				else if(msg[0].equals("VEC"))
+				{
+					// Consistency Test
+					processCount++;
+					String temp[] = msg[1].split(" ");
+					int vID = Integer.parseInt(temp[0]);
+					for(int i = 1; i < temp.length; i++)
+					{
+						Vector_Clock[vID][i-1] = Integer.parseInt(temp[i]);
+					}
+					if(processCount == node.size())
+					{
+						boolean consistent = true;
+						for(int i = 0; i < node.size(); i++)
+						{
+							int currV = Vector_Clock[i][i];
+							for(int j = 0; j < node.size(); j++)
+							{
+								if(i != j)
+								{
+									if(Vector_Clock[j][i] != 0 && currV < Vector_Clock[j][i])// Vector_Clock[j][i] is not allowed to be zero
+									{
+										consistent = false;
+										System.out.println("***** ERROR: Inconsistency Found: Process:"+i+" has happened before Process:"+j+" *****");
+									}
+								}
+							}
+						}
+						if(consistent)
+						{
+							System.out.println("******** SUCCESS:System is Consistent ********* for "+initiator+" ^^^^^^^");
+						}
+						// Resetting for next Verification
+						processCount = 0;
+						Vector_Clock = new int[node.size()][node.size()];
+					}
+				}
+				// Got "GET-ID", Reply with vector clock
+				// Processes reply back with VEC-ID vectorC
+				else if(msg[0].equals("GET"))
+				{
+					StringBuffer buf = new StringBuffer();
+					buf.append(msg[1]).append("=").
+					append("VEC").append("-").append(index).append(" ");
+					// Read Clock time from txt file, it represent my checkpoint state
+					File file = new File(filename);
+					BufferedReader reader = new BufferedReader(new FileReader(file));
+					String line  = null;
+					while ((line = reader.readLine()) != null) 
+					{
+						line = line.trim();
+						String buffer[] = line.split("-");
+						if(line.isEmpty() || line.charAt(0) == '#')		//Skipping comments or empty lines
+						{
+							continue;
+						}
+						else if( !(buffer[0].equals("SEQ") || buffer[0].equals("AMT") || buffer[0].equals("LLS") ||
+								buffer[0].equals("FLS") || buffer[0].equals("LLR") || buffer[0].equals("SENT")) )
+						{
+							String temp[] = buffer[1].split(" ");
+							for(int i = 0; i < temp.length; i++)
+							{
+								if(i == 0)
+								{
+									buf.append(temp[i]);
+									continue;
+								}
+								buf.append(" ").append(temp[i]);
+							}
+						}
+					}
+					System.out.println("Sending Vector Clock:"+buf.toString()+".");
+					fifo.putFIFO(new String(buf.toString()));
+				}
+				
+				// TO DO - Rollback
+				
+				else if(msg[0].equals("PREPRLBK"))
+				{
+					String[] data = msg[1].split(" ");
+					if(recover)
+					{
+						// Got PREPRLBK in rollbk mode, means I am already in Recovery Mode
+						StringBuffer str = new StringBuffer().append(Integer.parseInt(data[0])).append("=").append("SRLBK").append("-").
+								append(index).append(" ").append(Integer.parseInt(data[1]));
+						fifo.putFIFO(new String(str.toString()));
+					}
+				
+					else if(LLR.get(neighbors.indexOf(Integer.parseInt(data[0]))) > Integer.parseInt(data[2]))
+					{
+						acc.setFreeze(true);
+						recover = true;
+						//reset(this.LLR);
+						acc.setFLS(resetLabel(LLR.size()));
+						sender = Integer.parseInt(data[0]);
+						seqNum = Integer.parseInt(data[1]);
+						rollbackCnt = 0;
+						
+						File file = new File(filename);
+						BufferedReader br = new BufferedReader(new FileReader(file));
+						String line=br.readLine();
+						while(line!=null)
+						{
+							if(line.substring(0,4).equals("AMT"))
+							{
+								acc.setAmount(Integer.parseInt(line.substring(4)));
+							}
+							else if(line.substring(0,4).equals("LLS"))
+							{
+								line = line.substring(4);
+								String[] words = line.split(" ");
+								ArrayList<Integer> LLS = new ArrayList<Integer>();
+								for(int i=0;i<words.length;i++)
+								{
+									LLS.add(Integer.parseInt(words[i]));
+								}
+								acc.setCh_label(LLS);
+								acc.setLLS(LLS);
+							}
+							else if(line.substring(0,4).equals("CLK"))
+							{
+								line = line.substring(4);
+								String[] words = line.split(" ");
+								ArrayList<Integer> vector = new ArrayList<Integer>();
+								for(int i=0;i<words.length;i++)
+								{
+									vector.add(Integer.parseInt(words[i]));
+								}
+								acc.setVectorC(vector);
+							}
+							line=br.readLine();
+						}
+						
+						for(int i=0;i<neighbors.size();i++)
+						{
+							if(neighbors.get(i) != sender)		// To avoid sending the request again to the sender of rollback request
+							{
+								rollbackCnt++;
+								StringBuffer str = new StringBuffer().append(neighbors.get(i)).append("=").append("PREPRLBK").append("-")
+										.append(index).append(" ").append(seqNum).append(" ").append(acc.getLLS().get(i));
+								fifo.putFIFO(new String(str.toString()));
+							}
+						}
+						// If no one else to send, reply back SRBLK
+						if(rollbackCnt == 0)
+						{
+							StringBuffer str = new StringBuffer().append(sender).append("=").append("SRLBK")
+							.append("-").append(index).append(" ").append(Integer.parseInt(data[1]));
+							fifo.putFIFO(new String(str.toString()));
+						}
+					}
+					
+					//If the above condition fails then send the SRLBK message to the sender who may also be the initiator
+
+					else
+					{
+						rollbackCnt = 0;
+						sender = 0;
+						StringBuffer str = new StringBuffer().append(Integer.parseInt(data[0])).append("=").
+						append("SRLBK").append("-").append(index).append(" ").append(Integer.parseInt(data[1]));
+						fifo.putFIFO(new String(str.toString()));
+					}
+				}
+				
+				else if(msg[0].equals("SRLBK"))
+				{
+					String[] data = msg[1].split(" ");
+					rollbackCnt--;
+					if(sender == -1)	// I am the Initiator
+					{
+						if(rollbackCnt == 0)
+						{
+							for(int i=0;i<neighbors.size();i++)
+							{
+								StringBuffer str = new StringBuffer().append(neighbors.get(i)).append("=").append("ROLLBK")
+								.append("-").append(index).append(" ").append(Integer.parseInt(data[1]));
+								fifo.putFIFO(new String(str.toString()));
+							}
+							sendVerify();
+							nextInitiator();
+							seqNum = 0;
+							recover = false;
+							try {
+								TimeUnit.SECONDS.sleep(3);
+							} catch (InterruptedException e) {
+								// TODO Auto-generated catch block
+								e.printStackTrace();
+							}
+						}
+					}
+					else	//I am not the initiator
+					{
+						if(rollbackCnt == 0)
+						{
+							StringBuffer str = new StringBuffer().append(sender).append("=").append("SRLBK")
+							.append("-").append(index).append(" ").append(Integer.parseInt(data[1]));
+							fifo.putFIFO(new String(str.toString()));
+						}
+					}
+				}
+
+				else if(msg[0].equals("ROLLBK"))
+				{
+					if(recover && sender == Integer.parseInt(msg[1].split(" ")[0]) && seqNum == Integer.parseInt(msg[1].split(" ")[1]))
+					{
+						for(int i=0;i<neighbors.size();i++)
+						{
+							if(neighbors.get(i) != sender)		// To avoid sending the request again to the sender of rollback request
+							{
+								StringBuffer str = new StringBuffer().append(neighbors.get(i)).append("=").append("ROLLBK").append("-").
+								append(index).append(" ").append(seqNum);
+								fifo.putFIFO(new String(str.toString()));
+							}
+						}
+						sender = -1;
+						seqNum = 0;
+						recover = false;
+						rollbackCnt = 0;
+						acc.setFreeze(false);
+					}
+				}
+				//System.out.println("^^^^^^ Rollback Count:"+rollbackCnt+" ^^^^^^^^");
+			}// end of while(true)
+			
+		}// End of try for sctpchannel
+		catch (IOException e) 
+		{
+			e.printStackTrace();
+			System.exit(1);
+		}
+	}	
+
+	
+	public String byteToString(ByteBuffer byteBuffer, int length)
+	{
+		byteBuffer.position(0);
+		byteBuffer.limit(MESSAGE_SIZE);
+		byte[] bufArr = new byte[length];
+		byteBuffer.get(bufArr);
+		return new String(bufArr);
+	}
+	
+	// Return the reset label list
+	private ArrayList<Integer> resetLabel(int size)
+	{
+		ArrayList<Integer> label = new ArrayList<Integer>();
+		for(int i = 0; i< size; i++)
+		{
+			label.add(0);
+		}
+		return label;
+	}
+	
+	// Save Following:
+	// SEQ- (default = 1)
+	// AMT-	  (default = given at start)
+	// LLS-	  (default = all zeroes)
+	// FLS-	  (default = all zeroes)
+	// LLR-	  (default = all zeroes)
+	// CLK-	  (default = all zeroes)
+	// SENT-  (default = "NONE", sent messages from last permanent checkpoint to current permanent checkpoint)
+	// File Name: dc21_12345.txt
+	// Resets LLS, FLS, sentM
+	private void saveCheckpoint(String filename)
+	{
+		System.out.println("Saved Checkpoint State:");
+		try{
+			File file = new File(filename);
+			PrintWriter writer = new PrintWriter(new FileWriter(file,false));
+			writer.print("# Checkpoint State of System: "+index);
+			writer.flush();
+			writer.print(new String("\nSEQ-"+seqNum));
+			writer.flush();
+			writer.print(new String("\nAMT-"+acc.getAmount()));
+			writer.flush();
+			
+			ArrayList<Integer> LLS = acc.getLLS();
+			writer.print(new String("\nLLS-"));
+			for(int i=0; i < LLS.size(); i++)
+			{
+				if(i == 0)
+				{
+					writer.print(LLS.get(i));
+					continue;
+				}
+				writer.print(" "+LLS.get(i));
+			}
+			acc.setLLS(resetLabel(LLS.size()));
+			System.out.println("@@@ RESET LLS in Process:"+acc.getLLS());
+			writer.flush();
+			
+			ArrayList<Integer> FLS = acc.getFLS();
+			writer.print(new String("\nFLS-"));
+			for(int i=0; i < FLS.size(); i++)
+			{
+				if(i == 0)
+				{
+					writer.print(FLS.get(i));
+					continue;
+				}
+				writer.print(" "+FLS.get(i));
+			}
+			acc.setFLS(resetLabel(FLS.size()));
+			System.out.println("@@@ RESET FLS in Process:"+acc.getFLS());
+			writer.flush();
+			
+			writer.print(new String("\nLLR-"));
+			for(int i=0; i < LLR.size(); i++)
+			{
+				if(i == 0)
+				{
+					writer.print(LLR.get(i));
+					continue;
+				}
+				writer.print(" "+LLR.get(i));
+			}
+			writer.flush();
+			
+			writer.print(new String("\nCLK-"));
+			ArrayList<Integer> vectorC = acc.getVectorC();
+			for(int i = 0; i < vectorC.size(); i++)
+			{
+				if(i == 0)
+				{
+					writer.print(vectorC.get(i));
+					continue;
+				}
+				writer.print(" "+vectorC.get(i));
+			}
+			writer.flush();
+			
+			ArrayList<String> sentM = acc.getSentM();
+			writer.print(new String("\nSENT-"));
+			if(sentM.isEmpty())
+			{
+				writer.print("NONE");
+			}
+			else
+			{
+				for(int i=0; i < sentM.size(); i++)
+				{
+					if(i == 0)
+					{
+						writer.print(sentM.get(i));
+						continue;
+					}
+					writer.print(" "+sentM.get(i));
+				}
+			}
+			writer.flush();
+			acc.getSentM().clear();
+			System.out.println("@@@ RESET Sent Messages in Process:"+acc.getSentM());
+			
+			// Showing the saved checkpoint state
+			BufferedReader reader = new BufferedReader(new FileReader(file));
+			String line = null;
+			while( (line = reader.readLine()) != null)
+			{
+				System.out.println(line);
+			}
+		}
+		catch(IOException io)
+		{
+			io.printStackTrace();
+		}
+	}
+	
+	// Send TKCHK to cohorts, Reset the LLR 
+	private void sendToCohorts()
+	{
+		StringBuffer buf = null;
+		for(int i = 0; i < LLR.size(); i++)
+		{
+			if(LLR.get(i) > 0 && neighbors.get(i) != sender)
+			{
+				System.out.println("Process:"+index+" Sending TKCHK to:"+neighbors.get(i));
+				buf = new StringBuffer();
+				// Saving my cohorts
+				cohorts.add(neighbors.get(i));
+				buf.append(neighbors.get(i)).append("=").
+				append("TKCHK").append("-").append(index).append(" ").append(seqNum).append(" ").append(LLR.get(i));
+				fifo.putFIFO(new String(buf.toString()));
+			}
+			// Reset LLR
+			LLR.set(i, 0);
+		}
+		System.out.println("@@@ RESET LLR in Process:"+LLR);
+		System.out.println("-------- Process:"+index+" Cohort Size:"+cohorts.size());
+	}
+	
+	// Called by Current Initiator who finished protocol.
+	// Broadcasts NXT message
+	private void nextInitiator()
+	{
+		boolean next = false;
+		StringBuffer buf = null;
+		// No next protocol sequence to run
+		// FORMAT: NXT-DONE
+		if(sequence.size() == (initiator + 1))
+		{
+			for(int i = 0; i < node.size(); i++)
+			{
+				buf = new StringBuffer();
+				buf.append(i).append("=").
+				append("NXT").append("-").append("DONE");
+				fifo.putFIFO(new String(buf.toString()));
+			}
+		}
+		else
+		{
+			next = true;
+		}
+		
+		// Check the sequence, for next initiator, send broadcast, with current seqNum
+		// FORMAT: NXT-ID SEQ
+		if(next)
+		{
+			for(int i = 0; i < node.size(); i++)
+			{
+				buf = new StringBuffer();
+				buf.append(i).append("=").
+				append("NXT").append("-").append(initiator + 1).append(" ").append(seqNum);
+				fifo.putFIFO(new String(buf.toString()));
+			}
+		}
+	}
+	
+	// Initiator sends Broadcast, "GET-ID" to all nodes
+	private void sendVerify()
+	{
+		StringBuffer buf = null;
+		for(int i = 0; i < node.size(); i++)
+		{
+			buf = new StringBuffer();
+			buf.append(i).append("=").
+			append("GET").append("-").append(index);
+			fifo.putFIFO(new String(buf.toString()));
+			
+		}
+	}
+	
+	/*private void reset(ArrayList<Integer> temp)
+	{
+		for(int i=0;i<temp.size();i++)
+		{
+			temp.set(i,0);
+		}
+	}*/
+
+}
