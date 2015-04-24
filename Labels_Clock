@@ -1,0 +1,69 @@
+package pack;
+
+import java.util.ArrayList;
+
+
+// Keeps the FLS and LLS values, as updated by Account_Thread
+public class Labels_Clock {
+
+	// Last Label Sent
+	ArrayList<Integer> LLS;
+	// First Label Sent
+	ArrayList<Integer> FLS;
+	// Output Channel Sent Label, copy of LLS
+	ArrayList<Integer> ch_label;
+	// Vector Clock
+	ArrayList<Integer> vectorC;
+	
+	public Labels_Clock(int neighSize, int nodeSize)
+	{
+		LLS = new ArrayList<Integer>();
+		FLS = new ArrayList<Integer>();
+		ch_label = new ArrayList<Integer>();
+		vectorC = new ArrayList<Integer>();
+		
+		for(int i=0; i < neighSize; i++)
+		{
+			LLS.add(0);
+			FLS.add(0);
+			ch_label.add(0);
+		}
+		for(int i=0; i < nodeSize; i++)
+		{
+			vectorC.add(0);
+		}
+	}
+
+	public synchronized ArrayList<Integer> getLLS() {
+		return LLS;
+	}
+
+	public synchronized void setLLS(ArrayList<Integer> lls) {
+		LLS = lls;
+	}
+
+	public synchronized ArrayList<Integer> getFLS() {
+		return FLS;
+	}
+
+	public synchronized void setFLS(ArrayList<Integer> fls) {
+		FLS = fls;
+	}
+
+	public synchronized ArrayList<Integer> getCh_label() {
+		return ch_label;
+	}
+
+	public synchronized void setCh_label(ArrayList<Integer> ch_label) {
+		this.ch_label = ch_label;
+	}
+
+	public synchronized ArrayList<Integer> getVectorC() {
+		return vectorC;
+	}
+
+	public synchronized void setVectorC(ArrayList<Integer> vectorC) {
+		this.vectorC = vectorC;
+	}
+	
+}
